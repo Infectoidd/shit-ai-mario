@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Kart Mini — HTML5 Kart Racer</title>
+<style>
+  :root{--bg:#0b1220;--ui:#e9eef6;--accent:#ffb84d}
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg) 0%, #07101a 100%);font-family:Inter,Segoe UI,Arial;}
+  #container{display:flex;flex-direction:column;align-items:center;padding:12px;gap:8px;}
+  canvas{background:#1b6a2b;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.5);width:960px;height:640px;}
+  .hud{color:var(--ui);display:flex;gap:12px;align-items:center;font-weight:600}
+  .panel{background:rgba(0,0,0,.35);padding:8px 12px;border-radius:8px;backdrop-filter: blur(3px);}
+  .controls{font-size:13px;color:#cfe7ff}
+  footer{color:#9fb8d4;font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+<div id="container">
+  <div class="hud">
+    <div id="lap" class="panel">Lap: 0 / 3</div>
+    <div id="speed" class="panel">Speed: 0</div>
+    <div id="time" class="panel">Time: 00:00.000</div>
+    <div class="panel controls">
+      Controls: Arrow keys / WASD — Space = boost
+    </div>
+  </div>
+
+  <canvas id="game" width="960" height="640"></canvas>
+
+  <div style="display:flex;gap:10px;">
+    <button id="restart">Restart</button>
+    <button id="toggleAI">Toggle AI</button>
+  </div>
+
+  <footer>Embed-ready HTML5 kart demo — host and iframe into Google Sites.</footer>
+</div>
+
+<script>
+/* Kart Mini — Single-file game
+   Features:
+   - Player kart with acceleration/steering
+   - Basic AI kart following waypoints
+   - Track built from inner/outer bezier-like rings (donut shape)
+   - Boost pads and lap counting
+   - Minimap and simple UI
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+let last = performance.now();
+let running = true;
+let showAI = true;
+
+// Track geometry: define center and two loops (outer, inner) as parametric ellipses
+const cx = W/2, cy = H/2;
+const outer = {rx: 380, ry: 220};
+const inner = {rx: 160, ry: 80};
+
+// Simple function to compute point on ellipse by t [0..1)
+function ellipsePoint(r, t){
+  const a = r.rx, b = r.ry;
+  const ang = t * Math.PI * 2;
+  return {x: cx + Math.cos(ang)*a, y: cy + Math.sin(ang)*b};
+}
+
+// Generate a center racing line (midway between outer and inner) as waypoints
+const waypoints = [];
+for(let i=0;i<36;i++){
+  const t = i/36;
+  const out = ellipsePoint(outer,t);
+  const inn = ellipsePoint(inner,t);
+  waypoints.push({x: (out.x+inn.x)/2, y:(out.y+inn.y)/2});
+}
+
+// Boost pads (positions along outer ellipse)
+const boosts = [];
+for(let i=0;i<6;i++){
+  const t = (i/6)+0.02;
+  const p = ellipsePoint(outer,t);
+  boosts.push({x:p.x, y:p.y, r:18, active:true, cooldown:0});
+}
+
+// Utility
+function dist(a,b){ const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy); }
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function angleBetween(a,b){ return Math.atan2(b.y-a.y,b.x-a.x); }
+function formatTime(ms){
+  const s = Math.floor(ms/1000), m = Math.floor(s/60), ss = s%60;
+  const rem = ms%1000;
+  return `${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}.${String(rem).padStart(3,'0')}`;
+}
+
+// Kart class
+class Kart {
+  constructor(x,y,color='red'){
+    this.pos = {x,y};
+    this.vel = {x:0,y:0};
+    this.angle = 0;
+    this.speed = 0; // scalar
+    this.maxSpeed = 340; // pixels/sec
+    this.acc = 700; // px/s^2
+    this.brake = 1200;
+    this.turnSpeed = 3.2; // rad/s at base
+    this.color = color;
+    this.size = 18;
+    this.lap = 0;
+    this.checkpointIndex = 0; // index in waypoints for lap detection
+    this.bestLap = null;
+    this.lapStart = performance.now();
+    this.boostTimer = 0;
+    this.finished = false;
+  }
+  update(dt, controls){
+    // controls: {throttle: -1..1, steer: -1..1, boost:boolean}
+    // simple longitudinal dynamics
+    const throttle = controls.throttle || 0;
+    const steer = controls.steer || 0;
+    // change speed
+    if(throttle > 0){
+      this.speed += this.acc * throttle * dt;
+    } else {
+      this.speed -= this.brake * (-throttle) * dt;
+      // passive friction
+      this.speed -= 220 * dt;
+    }
+    // clamp
+    const ms = this.maxSpeed * (this.boostTimer>0 ? 1.6 : 1);
+    this.speed = clamp(this.speed, -80, ms);
+    // steering scaled by speed fraction
+    const steerEffect = steer * this.turnSpeed * (0.4 + 0.6 * (Math.abs(this.speed)/this.maxSpeed));
+    this.angle += steerEffect * dt;
+    // update position
+    this.pos.x += Math.cos(this.angle) * this.speed * dt;
+    this.pos.y += Math.sin(this.angle) * this.speed * dt;
+
+    // simple collision with track walls: push back if outside donut
+    const rx = (this.pos.x - cx), ry = (this.pos.y - cy);
+    const rOut = Math.hypot(rx/outer.rx, ry/outer.ry);
+    const rIn = Math.hypot(rx/inner.rx, ry/inner.ry);
+    if(rOut > 1){ // outside outer boundary
+      // push back by reflecting vector toward center
+      const pushAng = Math.atan2(ry,rx);
+      this.pos.x = cx + Math.cos(pushAng) * outer.rx * 0.995;
+      this.pos.y = cy + Math.sin(pushAng) * outer.ry * 0.995;
+      this.speed *= 0.45;
+    }
+    if(rIn < 1){ // inside inner hole
+      const pushAng = Math.atan2(ry,rx);
+      this.pos.x = cx + Math.cos(pushAng) * inner.rx * 1.005;
+      this.pos.y = cy + Math.sin(pushAng) * inner.ry * 1.005;
+      this.speed *= 0.45;
+    }
+
+    // update boost timer
+    if(this.boostTimer>0) this.boostTimer = Math.max(0, this.boostTimer - dt);
+
+    // checkpoints / lap detection: when crossing waypoint 0 from last to first
+    const wp = waypoints[this.checkpointIndex];
+    if(dist(this.pos, wp) < 40){
+      this.checkpointIndex = (this.checkpointIndex + 1) % waypoints.length;
+      if(this.checkpointIndex === 0){
+        // completed lap
+        const now = performance.now();
+        const lapTime = now - this.lapStart;
+        this.lap++;
+        this.lapStart = now;
+        if(this.bestLap === null || lapTime < this.bestLap) this.bestLap = lapTime;
+        if(this.lap >= 3) this.finished = true;
+      }
+    }
+  }
+  draw(g){
+    g.save();
+    g.translate(this.pos.x,this.pos.y);
+    g.rotate(this.angle);
+    // Kart body
+    g.fillStyle = this.color;
+    g.beginPath();
+    g.ellipse(0,0,this.size*1.3,this.size,0,0,Math.PI*2);
+    g.fill();
+    // top mask
+    g.fillStyle = "rgba(0,0,0,0.14)";
+    g.fillRect(-10,-10,20,8);
+    // direction marker
+    g.fillStyle = "#000";
+    g.fillRect(this.size, -2, 6,4);
+    g.restore();
+  }
+}
+
+// Create player and AI
+const player = new Kart(ellipsePoint(outer,0.98).x, ellipsePoint(outer,0.98).y,'#ff6b6b');
+player.angle = Math.PI/2;
+const ai = new Kart(ellipsePoint(outer,0.95).x, ellipsePoint(outer,0.95).y,'#6bd1ff');
+ai.angle = Math.PI/2;
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if(['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase())) e.preventDefault();});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+document.getElementById('restart').addEventListener('click', () => resetGame());
+document.getElementById('toggleAI').addEventListener('click', () => { showAI = !showAI; });
+
+function playerControls(){
+  const throttle = (keys['arrowup']||keys['w']?1:0) - (keys['arrowdown']||keys['s']?1:0);
+  const steer = (keys['arrowleft']||keys['a']?-1:0) + (keys['arrowright']||keys['d']?1:0);
+  const boost = !!keys[' '];
+  return {throttle,steer,boost};
+}
+
+// AI logic: follow next waypoint, apply throttle/steer, use boosts when available
+function aiControls(kart, dt){
+  const target = waypoints[kart.checkpointIndex];
+  const angTo = Math.atan2(target.y - kart.pos.y, target.x - kart.pos.x);
+  let diff = angTo - kart.angle;
+  while(diff > Math.PI) diff -= Math.PI*2;
+  while(diff < -Math.PI) diff += Math.PI*2;
+  const steer = clamp(diff*2, -1, 1);
+  // throttle scaled by angle
+  const throttle = clamp(1 - Math.abs(diff)*0.8, 0.25, 1);
+  // auto boost occasionally when going straight
+  const boost = (Math.abs(diff) < 0.15 && kart.boostTimer <= 0 && Math.random() < 0.006);
+  return {throttle, steer, boost};
+}
+
+// Reset
+function resetGame(){
+  player.pos = ellipsePoint(outer,0.98);
+  player.angle = Math.PI/2; player.speed = 0; player.lap = 0; player.checkpointIndex = 0; player.finished = false; player.lapStart = performance.now();
+  ai.pos = ellipsePoint(outer,0.95); ai.angle = Math.PI/2; ai.speed = 0; ai.lap = 0; ai.checkpointIndex=0; ai.finished=false; ai.lapStart = performance.now();
+  boosts.forEach(b => { b.active = true; b.cooldown = 0; });
+  startTime = performance.now();
+}
+
+// Game state
+let startTime = performance.now();
+resetGame();
+
+// Main loop
+function step(now){
+  const dt = Math.min(0.033, (now - last)/1000);
+  last = now;
+  update(dt);
+  render();
+  if(running) requestAnimationFrame(step);
+}
+
+function update(dt){
+  // update boosts cooldowns
+  boosts.forEach(b => { if(!b.active) b.cooldown = Math.max(0, b.cooldown - dt); if(b.cooldown === 0) b.active = true; });
+
+  // Player
+  const pC = playerControls();
+  // check boost pickup
+  boosts.forEach(b => {
+    if(b.active && dist(b, player.pos) < b.r + 10){
+      player.boostTimer = 0.85;
+      b.active = false;
+      b.cooldown = 3.5;
+    }
+  });
+  // manual boost via space if meter available (we allow limited manual boost if on-ground)
+  if(pC.boost && player.boostTimer <= 0) {
+    // small impulse
+    player.boostTimer = 0.35;
+  }
+  player.update(dt, pC);
+
+  // AI
+  if(showAI){
+    const aC = aiControls(ai, dt);
+    // AI picks up boosts automatically
+    boosts.forEach(b => {
+      if(b.active && dist(b, ai.pos) < b.r + 10){
+        ai.boostTimer = 0.9;
+        b.active = false;
+        b.cooldown = 3.5;
+      }
+    });
+    ai.update(dt, aC);
+  }
+
+  // Update UI
+  document.getElementById('lap').textContent = `Lap: ${player.lap} / 3`;
+  document.getElementById('speed').textContent = `Speed: ${Math.round(Math.abs(player.speed))}`;
+  const elapsed = performance.now() - startTime;
+  document.getElementById('time').textContent = `Time: ${formatTime(elapsed)}`;
+}
+
+// Rendering
+function render(){
+  // clear
+  ctx.clearRect(0,0,W,H);
+
+  // draw grass background pattern
+  ctx.fillStyle = "#2f9c56";
+  ctx.fillRect(0,0,W,H);
+
+  // draw outer track (as darker dirt)
+  drawEllipse(outer.rx, outer.ry, "#5b3b18");
+  // draw inner hole
+  drawEllipse(inner.rx, inner.ry, "#2f9c56");
+
+  // draw racing line/waypoints
+  ctx.lineWidth = 2;
+  for(let i=0;i<waypoints.length;i++){
+    const p = waypoints[i];
+    ctx.fillStyle = i%6===0 ? "#f4f142" : "rgba(255,255,255,0.25)";
+    ctx.beginPath(); ctx.arc(p.x,p.y, (i%6===0?4:2),0,Math.PI*2); ctx.fill();
+  }
+
+  // draw boosts
+  boosts.forEach(b => {
+    ctx.save();
+    ctx.translate(b.x,b.y);
+    ctx.beginPath();
+    ctx.fillStyle = b.active ? "rgba(255,200,80,0.95)" : "rgba(100,100,100,0.35)";
+    ctx.moveTo(0,-b.r); ctx.lineTo(b.r*0.6,0); ctx.lineTo(0,b.r); ctx.lineTo(-b.r*0.6,0); ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  });
+
+  // draw players
+  if(showAI) ai.draw(ctx);
+  player.draw(ctx);
+
+  // minimap (top-right)
+  drawMiniMap();
+}
+
+function drawEllipse(rx, ry, color){
+  ctx.save();
+  ctx.translate(cx,cy);
+  ctx.beginPath();
+  ctx.ellipse(0,0,rx,ry,0,0,Math.PI*2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawMiniMap(){
+  const w = 200, h = 120;
+  const x = W - w - 10, y = 10;
+  // background
+  ctx.save();
+  ctx.globalAlpha = 0.9;
+  ctx.fillStyle = "rgba(8,12,18,0.8)";
+  roundRect(ctx, x, y, w, h, 8, true, false);
+  ctx.globalAlpha = 1;
+  // draw simplified track
+  ctx.save();
+  ctx.beginPath();
+  ctx.translate(x + w/2, y + h/2);
+  const scaleX = (w*0.42)/outer.rx;
+  const scaleY = (h*0.42)/outer.ry;
+  ctx.scale(scaleX, scaleY);
+  ctx.fillStyle = "#4a2f12";
+  ctx.beginPath(); ctx.ellipse(0,0, outer.rx, outer.ry,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = "#123d23"; ctx.beginPath(); ctx.ellipse(0,0, inner.rx, inner.ry,0,0,Math.PI*2); ctx.fill();
+  // karts
+  ctx.setTransform(1,0,0,1,0,0); // reset to draw marker coords
+  ctx.restore();
+
+  // draw kart markers transformed to minimap
+  const transformPoint = (p) => {
+    const dx = p.x - cx, dy = p.y - cy;
+    return {
+      x: x + w/2 + dx * scaleX,
+      y: y + h/2 + dy * scaleY
+    };
+  };
+  const pp = transformPoint(player.pos);
+  ctx.fillStyle = player.color; ctx.beginPath(); ctx.arc(pp.x,pp.y,5,0,Math.PI*2); ctx.fill();
+  if(showAI){
+    const ap = transformPoint(ai.pos);
+    ctx.fillStyle = ai.color; ctx.beginPath(); ctx.arc(ap.x,ap.y,5,0,Math.PI*2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// small helper for rounded rect
+function roundRect(ctx, x, y, w, h, r, fill, stroke){
+  if (typeof r === 'undefined') r = 5;
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+// Start the loop
+requestAnimationFrame(step);
+
+// Optional: pause when tab hidden to save CPU
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){ running = false; } else { if(!running){ running = true; last = performance.now(); requestAnimationFrame(step); } }
+});
+</script>
+</body>
+</html>
